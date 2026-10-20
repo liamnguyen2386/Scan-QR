@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quét dữ liệu QR</title>
+<style>
+  body { font-family: Arial, sans-serif; margin: 0; padding: 16px; background: #f4f6f8; }
+  h1 { font-size: 20px; text-align: center; margin: 4px 0 16px; }
+  .btn { display: block; width: 100%; padding: 20px; font-size: 22px; border: 0;
+    border-radius: 12px; margin-bottom: 12px; text-align: center; box-sizing: border-box;
+    background: #1a73e8; color: #fff; font-weight: bold; cursor: pointer; }
+  .btn.stop { background: #d93025; }
+  #reader { width: 100%; margin-bottom: 12px; border-radius: 12px; overflow: hidden; }
+  #status { text-align: center; font-size: 17px; font-weight: bold; min-height: 24px; margin: 8px 0 12px; }
+  .ok { color: #188038; } .err { color: #d93025; } .wait { color: #1a73e8; }
+  #list { margin: 0; padding: 0; list-style: none; }
+  #list li { background: #fff; border-radius: 8px; padding: 10px 12px; margin-bottom: 8px;
+    font-size: 15px; word-break: break-word; border-left: 5px solid #9aa0a6; }
+  #list li.ok { border-left-color: #188038; color: #202124; }
+  #list li.err { border-left-color: #d93025; color: #202124; }
+  #list li.wait { border-left-color: #1a73e8; color: #202124; }
+  #list small { display: block; color: #5f6368; margin-top: 2px; }
+  #list li.err small { color: #d93025; }
+  .mini { margin-top: 6px; margin-right: 6px; padding: 6px 12px; font-size: 14px; border: 0;
+    border-radius: 6px; background: #e8eaed; }
+  #counter { text-align: center; color: #5f6368; font-size: 14px; margin: 12px 0; }
+</style>
+</head>
+<body>
+  <h1>Quét dữ liệu QR</h1>
+
+  <button class="btn" id="btnScan">Quét dữ liệu</button>
+  <div id="reader"></div>
+  <div id="status"></div>
+  <ul id="list"></ul>
+  <div id="counter"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<script>
+  const API_URL = 'https://script.google.com/macros/s/AKfycbzH54NyMQMzz1W6usIU2F9QYvQ63avd6B6qapqFerMLafDm9F8Mvzk5ZobfurFjyoiJJA/exec';
+  const FIELD_COUNT = 7;
+  const COOLDOWN_MS = 5000;   // bỏ qua cùng một mã quét lại trong 5 giây
+
+  const $ = id => document.getElementById(id);
+  let scanner = null, scanning = false;
+  let queue = [], nextId = 1, sending = false, savedCount = 0;
+  let lastText = '', lastTime = 0;
+  let audioCtx = null;
+
+  function status(text, cls) { $('status').textContent = text; $('status').className = cls || ''; }
+
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  function parse(text) {
+    const seps = ['\n', '\t', '|', ';', ','];
+    for (const s of seps) {
+      const p = text.split(s).map(x => x.trim());
+      if (p.length >= FIELD_COUNT) return p.slice(0, FIELD_COUNT);
+    }
+    return null;
+  }
+
+  function beep() {
+    try {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+      o.frequency.value = 1000; g.gain.value = 0.15;
+      o.connect(g); g.connect(audioCtx.destination);
+      o.start(); o.stop(audioCtx.currentTime + 0.12);
+    } catch (e) {}
+    if (navigator.vibrate) navigator.vibrate(120);
+  }
+
+  // ---------- Hàng đợi lưu ngầm ----------
+  function render() {
+    const items = queue.slice(-10).reverse();
+    $('list').innerHTML = items.map(it => {
+      const label = it.state === 'ok' ? '✔ Đã lưu (dòng ' + it.row + ')'
+                  : it.state === 'wait' ? '⏳ Đang lưu...'
+                  : '✘ ' + esc(it.msg);
+      let btns = '';
+      if (it.state === 'err') {
+        btns = '<br><button class="mini" data-act="retry" data-id="' + it.id + '">Thử lại</button>' +
+               '<button class="mini" data-act="drop" data-id="' + it.id + '">Bỏ</button>';
+      }
+      return '<li class="' + it.state + '"><b>' + esc(it.f[0]) + '</b> | ' + esc(it.f[1]) +
+             ' | ' + esc(it.f[3]) + '<small>' + label + '</small>' + btns + '</li>';
+    }).join('');
+    $('counter').textContent = 'Đã lưu trong phiên này: ' + savedCount;
+  }
+
+  async function pump() {
+    if (sending) return;
+    const it = queue.find(x => x.state === 'wait');
+    if (!it) return;
+    sending = true;
+    try {
+      const res = await fetch(API_URL, { method: 'POST', body: JSON.stringify({ fields: it.f }) });
+      const r = await res.json();
+      if (r.ok) { it.state = 'ok'; it.row = r.row; savedCount++; }
+      else { it.state = 'err'; it.msg = 'Lưu thất bại: ' + r.error; }
+        } catch (e) {
+      it.state = 'err'; it.msg = 'Lỗi kết nối (' + e.message + '). Hãy kiểm tra URL Apps Script và quyền truy cập "Bất kỳ ai".';
+    }
+    sending = false; render(); pump();
+  }
+
+  $('list').addEventListener('click', e => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    const id = Number(b.dataset.id);
+    if (b.dataset.act === 'retry') {
+      const it = queue.find(x => x.id === id);
+      if (it) { it.state = 'wait'; render(); pump(); }
+    } else if (b.dataset.act === 'drop') {
+      queue = queue.filter(x => x.id !== id); render();
+    }
+  });
+
+  // ---------- Quét trực tiếp bằng camera ----------
+  function onScan(text) {
+    const now = Date.now();
+    if (text === lastText && now - lastTime < COOLDOWN_MS) { lastTime = now; return; }
+    lastText = text; lastTime = now;
+    const f = parse(text);
+    if (!f) {
+      status('✘ Mã QR không đủ ' + FIELD_COUNT + ' trường: ' + text, 'err');
+      return;
+    }
+    beep();
+    status('✔ Đã đọc mã, hãy đưa mã tiếp theo vào khung', 'ok');
+    queue.push({ id: nextId++, f: f, state: 'wait' });
+    render(); pump();
+  }
+
+  async function startScan() {
+    if (API_URL.indexOf('http') !== 0) { status('Chưa dán URL Apps Script vào tệp.', 'err'); return; }
+    try {
+      scanner = new Html5Qrcode('reader', {
+        formatsToSupport: [Html5QrcodeSupportedFormats.QR_CODE],
+        experimentalFeatures: { useBarCodeDetectorIfSupported: true }
+      });
+      await scanner.start(
+        { facingMode: 'environment' },
+        {
+          fps: 15,
+          qrbox: (w, h) => { const s = Math.floor(Math.min(w, h) * 0.75); return { width: s, height: s }; },
+          videoConstraints: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } }
+        },
+        onScan, () => {}
+      );
+      scanning = true;
+      $('btnScan').textContent = 'Dừng camera';
+      $('btnScan').classList.add('stop');
+      status('Đưa mã QR vào khung hình', 'wait');
+    } catch (e) {
+      status('✘ Không mở được camera. Hãy cho phép truy cập camera trong cài đặt trình duyệt.', 'err');
+    }
+  }
+
+  async function stopScan() {
+    try { await scanner.stop(); scanner.clear(); } catch (e) {}
+    scanning = false;
+    $('btnScan').textContent = 'Quét dữ liệu';
+    $('btnScan').classList.remove('stop');
+    status('');
+  }
+
+  $('btnScan').onclick = () => scanning ? stopScan() : startScan();
+</script>
+</body>
+</html>
