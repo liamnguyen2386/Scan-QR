@@ -11,6 +11,8 @@
     border-radius: 12px; margin-bottom: 12px; text-align: center; box-sizing: border-box;
     background: #1a73e8; color: #fff; font-weight: bold; cursor: pointer; }
   .btn.stop { background: #d93025; }
+  .btn.photo { background: #f9ab00; color: #202124; }
+  .btn.gray { background: #e8eaed; color: #202124; font-size: 18px; padding: 14px; font-weight: normal; }
   .btn:disabled { background: #9aa0a6; }
   input[type=text], input[type=email] { width: 100%; box-sizing: border-box; padding: 16px; font-size: 20px;
     border: 1px solid #c4c7c5; border-radius: 10px; margin-bottom: 12px; }
@@ -61,24 +63,35 @@
   <div id="tools">
     <span>Zoom</span><input type="range" id="zoom"><button id="btnTorch">Đèn</button>
   </div>
+
+  <!-- Chế độ chụp ảnh (tự hiện khi quét trực tiếp không đọc được) -->
+  <div id="photoBox" style="display:none">
+    <label class="btn photo">Chụp ảnh mã QR
+      <input type="file" accept="image/*" capture="environment" id="file" hidden>
+    </label>
+    <button class="btn gray" id="btnBackLive">Quay lại quét trực tiếp</button>
+  </div>
+
   <div id="status"></div>
   <div id="counter"></div>
   <ul id="list"></ul>
 </div>
+<div id="readerFile" style="display:none"></div>
 
 <script src="https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
 <script>
   const API_URL = 'https://script.google.com/macros/s/AKfycbzH54NyMQMzz1W6usIU2F9QYvQ63avd6B6qapqFerMLafDm9F8Mvzk5ZobfurFjyoiJJA/exec';
   const FIELD_COUNT = 7;
   const DATE_FIELDS = [4, 7];
-  const COOLDOWN_MS = 5000;     // bỏ qua cùng một mã quét lại trong 5 giây
-  const PAUSE_MS = 1200;        // tạm dừng camera sau mỗi lần đọc thành công
-  const MAX_PARALLEL = 2;       // số mã gửi đồng thời
-  const TIMEOUT_MS = 40000;     // quá thời gian này coi như lỗi
+  const COOLDOWN_MS = 5000;       // bỏ qua cùng một mã quét lại trong 5 giây
+  const PAUSE_MS = 1200;          // tạm dừng camera sau mỗi lần đọc thành công
+  const AUTO_PHOTO_MS = 5000;     // quá thời gian này không đọc được mã thì chuyển sang chụp ảnh
+  const MAX_PARALLEL = 2;         // số mã gửi đồng thời
+  const TIMEOUT_MS = 40000;       // quá thời gian này coi như lỗi
 
   const $ = id => document.getElementById(id);
   let token = '', userEmail = '';
-  let scanner = null, scanning = false;
+  let scanner = null, scanning = false, scanTimer = null, photoBusy = false;
   let queue = [], nextId = 1, active = 0, savedCount = 0, dupCount = 0;
   let lastText = '', lastTime = 0;
   let sessionKeys = new Set();
@@ -106,6 +119,7 @@
 
   function showLogin(msg, cls) {
     $('appView').style.display = 'none';
+    $('photoBox').style.display = 'none';
     $('loginView').style.display = 'block';
     $('otpBox').style.display = 'none';
     $('otp').value = '';
@@ -266,32 +280,60 @@
     if (queue.some(x => x.state === 'wait' || x.state === 'send')) { e.preventDefault(); e.returnValue = ''; }
   });
 
-  // ---------- Quét trực tiếp bằng camera ----------
-  function pauseThenResume() {
-    try { scanner.pause(true); } catch (e) { return; }
-    setTimeout(() => { if (scanning) { try { scanner.resume(); } catch (e) {} } }, PAUSE_MS);
-  }
-
-  function onScan(text) {
-    const now = Date.now();
-    if (text === lastText && now - lastTime < COOLDOWN_MS) { lastTime = now; return; }
-    lastText = text; lastTime = now;
-
+  // ---------- Xử lý nội dung mã QR (dùng chung cho quét trực tiếp và chụp ảnh) ----------
+  // Trả về true nếu mã hợp lệ và đã đưa vào hàng đợi lưu
+  function handleText(text) {
     const f = parse(text);
-    if (!f) { status('✘ Mã QR không đủ ' + FIELD_COUNT + ' trường: ' + text, 'err'); return; }
+    if (!f) { status('✘ Mã QR không đủ ' + FIELD_COUNT + ' trường: ' + text, 'err'); return false; }
     for (const no of DATE_FIELDS) {
-      if (!validDate(f[no - 1])) { status('✘ Trường ' + no + ' không phải ngày hợp lệ: ' + f[no - 1] + '. Hãy quét lại.', 'err'); return; }
+      if (!validDate(f[no - 1])) {
+        status('✘ Trường ' + no + ' không phải ngày hợp lệ: ' + f[no - 1] + '. Hãy quét lại.', 'err');
+        return false;
+      }
     }
     const k = keyOf(f);
-    if (sessionKeys.has(k)) { status('⚠ Mã này đã quét trong phiên làm việc, không gửi lại.', 'dupc'); return; }
+    if (sessionKeys.has(k)) { status('⚠ Mã này đã quét trong phiên làm việc, không gửi lại.', 'dupc'); return false; }
     sessionKeys.add(k);
 
     beep();
     status('✔ Đã đọc mã, đưa mã tiếp theo vào khung', 'ok');
     queue.push({ id: nextId++, f: f, state: 'wait' });
     render();
-    pauseThenResume();
     pump();
+    return true;
+  }
+
+  // ---------- Quét trực tiếp bằng camera ----------
+  function armTimer() {
+    clearTimeout(scanTimer);
+    if (scanning) scanTimer = setTimeout(switchToPhoto, AUTO_PHOTO_MS);
+  }
+  function clearTimer() { clearTimeout(scanTimer); scanTimer = null; }
+
+  function pauseThenResume() {
+    try { scanner.pause(true); } catch (e) { return; }
+    setTimeout(() => {
+      if (scanning) { try { scanner.resume(); } catch (e) {} armTimer(); }
+    }, PAUSE_MS);
+  }
+
+  function onScan(text) {
+    clearTimer();
+    const now = Date.now();
+    if (text === lastText && now - lastTime < COOLDOWN_MS) { lastTime = now; armTimer(); return; }
+    lastText = text; lastTime = now;
+    if (handleText(text)) pauseThenResume();
+    else armTimer();
+  }
+
+  // Quá 5 giây không đọc được: tắt camera trực tiếp và chuyển sang chụp ảnh
+  async function switchToPhoto() {
+    if (!scanning) return;
+    await stopScan();
+    $('photoBox').style.display = 'block';
+    status('Không đọc được mã trực tiếp. Hãy chạm nút vàng để chụp ảnh mã QR.', 'err');
+    if (navigator.vibrate) navigator.vibrate([150, 80, 150]);
+    try { $('file').click(); } catch (e) {}   // có thể bị trình duyệt chặn, khi đó chạm nút vàng
   }
 
   function getTrack() {
@@ -311,7 +353,7 @@
       const z = $('zoom');
       z.min = c.zoom.min; z.max = c.zoom.max; z.step = c.zoom.step || 0.1; z.value = c.zoom.min;
       z.oninput = () => t.applyConstraints({ advanced: [{ zoom: Number(z.value) }] }).catch(() => {});
-      z.style.display = 'block'; any = true;
+      any = true;
     }
     $('zoom').style.display = c.zoom ? 'block' : 'none';
     $('btnTorch').style.display = c.torch ? 'inline-block' : 'none';
@@ -327,6 +369,8 @@
 
   async function startScan() {
     if (API_URL.indexOf('http') !== 0) { status('Chưa dán URL Apps Script vào tệp.', 'err'); return; }
+    if (scanning) return;
+    $('photoBox').style.display = 'none';
     try {
       scanner = new Html5Qrcode('reader', {
         formatsToSupport: [Html5QrcodeSupportedFormats.QR_CODE],
@@ -345,12 +389,15 @@
       $('btnScan').classList.add('stop');
       status('Đưa mã QR vào khung hình', 'wait');
       setTimeout(setupCamera, 500);
+      armTimer();
     } catch (e) {
       status('✘ Không mở được camera. Hãy cho phép truy cập camera trong cài đặt trình duyệt.', 'err');
+      $('photoBox').style.display = 'block';
     }
   }
 
   async function stopScan() {
+    clearTimer();
     if (!scanning) return;
     scanning = false;
     try { await scanner.stop(); scanner.clear(); } catch (e) {}
@@ -361,6 +408,71 @@
     status('');
   }
 
+  // ---------- Chụp ảnh và đọc mã (chế độ dự phòng) ----------
+  function resizeBlob(file, maxSide) {
+    return createImageBitmap(file).then(bmp => new Promise(resolve => {
+      const k = Math.min(1, maxSide / Math.max(bmp.width, bmp.height));
+      const c = document.createElement('canvas');
+      c.width = Math.round(bmp.width * k);
+      c.height = Math.round(bmp.height * k);
+      c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+      c.toBlob(b => resolve(b), 'image/jpeg', 0.95);
+    }));
+  }
+
+  async function nativeDecode(blob) {
+    if (!('BarcodeDetector' in window)) return null;
+    try {
+      const det = new BarcodeDetector({ formats: ['qr_code'] });
+      const bmp = await createImageBitmap(blob);
+      const r = await det.detect(bmp);
+      return r.length ? r[0].rawValue : null;
+    } catch (e) { return null; }
+  }
+
+  async function decodeFile(file) {
+    const s = new Html5Qrcode('readerFile', {
+      formatsToSupport: [Html5QrcodeSupportedFormats.QR_CODE],
+      experimentalFeatures: { useBarCodeDetectorIfSupported: true }
+    });
+    try {
+      for (const size of [0, 2000, 1400, 1000, 700, 480]) {
+        let blob = file;
+        if (size) {
+          try { blob = await resizeBlob(file, size); } catch (e) { continue; }
+        }
+        let text = await nativeDecode(blob);
+        if (text) return text;
+        try {
+          text = await s.scanFile(new File([blob], 'q.jpg', { type: 'image/jpeg' }), false);
+          if (text) return text;
+        } catch (e) {}
+      }
+      return null;
+    } finally {
+      try { s.clear(); } catch (x) {}
+    }
+  }
+
+  $('file').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    e.target.value = '';
+    if (!file || photoBusy) return;
+    photoBusy = true;
+    status('Đang đọc mã QR từ ảnh...', 'wait');
+    const text = await decodeFile(file);
+    photoBusy = false;
+    if (!text) {
+      status('✘ Không đọc được mã trong ảnh. Hãy chụp lại, gần hơn, rõ nét hơn và đủ sáng.', 'err');
+      return;
+    }
+    if (handleText(text)) {
+      $('photoBox').style.display = 'none';
+      startScan();   // tự quay lại quét trực tiếp cho mã tiếp theo
+    }
+  });
+
+  $('btnBackLive').onclick = () => startScan();
   $('btnScan').onclick = () => scanning ? stopScan() : startScan();
   $('btnSendOtp').onclick = sendOtp;
   $('btnVerify').onclick = verifyOtp;
